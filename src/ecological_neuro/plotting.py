@@ -57,6 +57,7 @@ def plot_direction_maps(
     directions: tuple[str, str],
     units: str,
     signed: bool,
+    figsize: tuple[float, float] = (10, 4),
 ) -> Figure:
     """Plot spatial values for two movement directions on matched axes."""
     limit = (
@@ -65,7 +66,7 @@ def plot_direction_maps(
         else samples[variable].quantile(0.99)
     )
     vmin, cmap = (-limit, "RdBu") if signed else (0, "viridis")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharex=True, sharey=True)
+    fig, axes = plt.subplots(1, 2, figsize=figsize, sharex=True, sharey=True)
     for ax, direction in zip(axes, directions):
         selected = samples[samples[direction_column].eq(direction)]
         ax.scatter(background[x_column], background[y_column], s=1, color="lightgrey")

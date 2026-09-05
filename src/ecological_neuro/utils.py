@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
+import pandas as pd
 from scipy.ndimage import gaussian_filter1d
 
 
@@ -14,6 +15,7 @@ __all__ = [
     "calculate_closure_speed",
     "detect_braking_period",
     "differentiate_time_series",
+    "find_distance_matched_pairs",
     "smooth_time_series",
 ]
 
@@ -141,6 +143,78 @@ def calculate_closure_speed(
     return -differentiate_time_series(
         timestamps_s, smoothed_gap, max_gap_multiplier=max_gap_multiplier
     )
+
+
+def find_distance_matched_pairs(
+    ids: Sequence[object],
+    distances: Sequence[float],
+    speeds: Sequence[float],
+    *,
+    max_distance_difference: float,
+    min_speed_ratio: float,
+) -> pd.DataFrame:
+    """Find similar-distance pairs with different speeds and flag non-reused pairs."""
+    id_array = np.asarray(ids, dtype=object)
+    distance_array = np.asarray(distances, dtype=float)
+    speed_array = np.asarray(speeds, dtype=float)
+    if any(array.ndim != 1 for array in (id_array, distance_array, speed_array)):
+        raise ValueError("ids, distances, and speeds must be 1D.")
+    if len({len(id_array), len(distance_array), len(speed_array)}) != 1:
+        raise ValueError("ids, distances, and speeds must have equal lengths.")
+    if max_distance_difference < 0:
+        raise ValueError("max_distance_difference must be non-negative.")
+    if min_speed_ratio < 1:
+        raise ValueError("min_speed_ratio must be at least 1.")
+
+    candidates = []
+    valid = np.isfinite(distance_array) & np.isfinite(speed_array) & (speed_array > 0)
+    valid_indices = np.flatnonzero(valid)
+    for offset, first_index in enumerate(valid_indices):
+        for second_index in valid_indices[offset + 1 :]:
+            distance_difference = abs(
+                distance_array[first_index] - distance_array[second_index]
+            )
+            speed_ratio = max(
+                speed_array[first_index], speed_array[second_index]
+            ) / min(speed_array[first_index], speed_array[second_index])
+            if (
+                distance_difference <= max_distance_difference
+                and speed_ratio >= min_speed_ratio
+            ):
+                candidates.append(
+                    {
+                        "first_index": int(first_index),
+                        "second_index": int(second_index),
+                        "first_id": id_array[first_index],
+                        "second_id": id_array[second_index],
+                        "distance_difference": float(distance_difference),
+                        "speed_ratio": float(speed_ratio),
+                    }
+                )
+
+    columns = [
+        "first_index",
+        "second_index",
+        "first_id",
+        "second_id",
+        "distance_difference",
+        "speed_ratio",
+        "selected",
+    ]
+    if not candidates:
+        return pd.DataFrame(columns=columns)
+
+    pairs = pd.DataFrame(candidates).sort_values(
+        ["distance_difference", "speed_ratio"], ascending=[True, False]
+    ).reset_index(drop=True)
+    pairs["selected"] = False
+    used_indices: set[int] = set()
+    for pair_index, pair in pairs.iterrows():
+        indices = {int(pair["first_index"]), int(pair["second_index"])}
+        if used_indices.isdisjoint(indices):
+            pairs.at[pair_index, "selected"] = True
+            used_indices.update(indices)
+    return pairs[columns]
 
 
 def calculate_braking_metrics(

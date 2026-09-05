@@ -5,6 +5,7 @@ from src.ecological_neuro.utils import (
     calculate_closure_speed,
     detect_braking_period,
     differentiate_time_series,
+    find_distance_matched_pairs,
     smooth_time_series,
 )
 
@@ -93,3 +94,18 @@ def test_calculates_braking_point_and_period_metrics() -> None:
     assert np.isclose(metrics.mean_deceleration, 3.0)
     assert np.isclose(metrics.max_deceleration, 3.0)
     assert np.isclose(metrics.negative_acceleration_fraction, 1.0)
+
+
+def test_finds_distance_matched_speed_contrasts_without_reusing_samples() -> None:
+    pairs = find_distance_matched_pairs(
+        ids=["a", "b", "c", "d"],
+        distances=[10.0, 10.5, 11.0, 20.0],
+        speeds=[100.0, 90.0, 160.0, 200.0],
+        max_distance_difference=1.0,
+        min_speed_ratio=1.5,
+    )
+
+    assert len(pairs) == 2
+    assert pairs["selected"].sum() == 1
+    selected = pairs[pairs["selected"]].iloc[0]
+    assert {selected["first_id"], selected["second_id"]} == {"b", "c"}
