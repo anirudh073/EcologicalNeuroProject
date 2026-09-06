@@ -23,8 +23,10 @@ __all__ = [
     "fit_winsorized_spline_state",
     "hazard_calibration_table",
     "make_group_holdout_splits",
+    "mean_discrete_hazard_event_distribution",
     "score_discrete_hazard_predictions",
     "smooth_time_series",
+    "smoothed_event_mass_mode",
     "summarize_paired_hazard_scores",
     "transform_winsorized_natural_cubic_spline",
 ]
@@ -669,13 +671,14 @@ def score_discrete_hazard_predictions(
     split_id: int,
     model_name: str,
     probability_floor: float = 1e-12,
+    event_time_smoothing_sigma_s: float = 0.01,
 ) -> pd.DataFrame:
     """Score one discrete-time hazard prediction per complete held-out group.
 
     The event probability is the cumulative incidence predicted before the last
-    observed at-risk bin. Predicted onset time is its conditional mean, given
-    onset within that observed interval. Each group may contain zero or one
-    observed event.
+    observed at-risk bin. Predicted onset time is the mode of a lightly
+    smoothed unconditional event-mass curve. Each group may contain zero or
+    one observed event.
     """
     required_columns = {group_column, time_column, event_column}
     missing_columns = required_columns.difference(data.columns)
@@ -683,6 +686,8 @@ def score_discrete_hazard_predictions(
         raise ValueError(f"data is missing columns: {sorted(missing_columns)}")
     if not 0 < probability_floor < 0.5:
         raise ValueError("probability_floor must be in (0, 0.5).")
+    if event_time_smoothing_sigma_s < 0:
+        raise ValueError("event_time_smoothing_sigma_s must be non-negative.")
 
     hazard_array = np.asarray(hazard, dtype=float)
     if hazard_array.ndim != 1 or len(hazard_array) != len(data):
@@ -710,10 +715,10 @@ def score_discrete_hazard_predictions(
         event_probability = float(cumulative_event_probability[-1])
         observed_event = float(event.any())
         observed_time = float(time_s[event][0]) if event.any() else np.nan
-        predicted_time = (
-            float(np.sum(event_mass * time_s) / event_probability)
-            if event_probability > probability_floor
-            else np.nan
+        predicted_time, _ = smoothed_event_mass_mode(
+            event_mass,
+            time_s,
+            smoothing_sigma_s=event_time_smoothing_sigma_s,
         )
         negative_log_likelihood = -float(
             np.sum(
@@ -757,6 +762,72 @@ def discrete_hazard_event_distribution(
     survival_before = np.concatenate(([1.0], np.cumprod(1.0 - hazard_array[:-1])))
     event_mass = survival_before * hazard_array
     return event_mass, np.cumsum(event_mass)
+
+
+def mean_discrete_hazard_event_distribution(
+    hazards: Sequence[Sequence[float]],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Average event distributions from several discrete-hazard predictions.
+
+    Each model's hazard is first converted to its unconditional event-mass
+    distribution. Averaging raw hazards would be incorrect because the
+    hazard-to-event-mass transformation includes survival from earlier bins.
+    """
+    hazard_array = np.asarray(hazards, dtype=float)
+    if hazard_array.ndim != 2 or hazard_array.shape[0] == 0 or hazard_array.shape[1] == 0:
+        raise ValueError("hazards must be a non-empty 2D array of probabilities.")
+    if not np.isfinite(hazard_array).all() or np.any(
+        (hazard_array < 0) | (hazard_array > 1)
+    ):
+        raise ValueError("hazards must contain finite probabilities in [0, 1].")
+    survival_before = np.concatenate(
+        (
+            np.ones((hazard_array.shape[0], 1)),
+            np.cumprod(1.0 - hazard_array[:, :-1], axis=1),
+        ),
+        axis=1,
+    )
+    mean_event_mass = np.mean(survival_before * hazard_array, axis=0)
+    return mean_event_mass, np.cumsum(mean_event_mass)
+
+
+def smoothed_event_mass_mode(
+    event_mass: Sequence[float],
+    time_s: Sequence[float],
+    *,
+    smoothing_sigma_s: float = 0.01,
+) -> tuple[float, np.ndarray]:
+    """Return the MAP event time from a lightly smoothed event-mass curve.
+
+    ``event_mass`` is the unconditional probability of an event in each
+    discrete time bin, rather than the conditional hazard. Gaussian smoothing
+    is expressed in seconds and uses the median bin width, so this function is
+    intended for regularly sampled discrete-time hazard tables.
+    """
+    mass = np.asarray(event_mass, dtype=float)
+    time = np.asarray(time_s, dtype=float)
+    if mass.ndim != 1 or mass.size == 0:
+        raise ValueError("event_mass must be a non-empty 1D sequence.")
+    if time.shape != mass.shape or not np.isfinite(time).all():
+        raise ValueError("time_s must be finite and have one value per event-mass bin.")
+    if not np.isfinite(mass).all() or np.any(mass < 0):
+        raise ValueError("event_mass must contain finite, non-negative values.")
+    if smoothing_sigma_s < 0:
+        raise ValueError("smoothing_sigma_s must be non-negative.")
+    if mass.size == 1 or smoothing_sigma_s == 0:
+        smoothed_mass = mass.copy()
+    else:
+        intervals_s = np.diff(time)
+        if np.any(intervals_s <= 0):
+            raise ValueError("time_s must be strictly increasing within a group.")
+        median_interval_s = float(np.median(intervals_s))
+        smoothed_mass = gaussian_filter1d(
+            mass,
+            sigma=smoothing_sigma_s / median_interval_s,
+            mode="nearest",
+        )
+    mode_index = int(np.argmax(smoothed_mass))
+    return float(time[mode_index]), smoothed_mass
 
 
 def hazard_calibration_table(
@@ -858,12 +929,14 @@ def evaluate_repeated_hazard_holdout(
     model_names: Sequence[str],
     splits: Sequence[tuple[np.ndarray, np.ndarray]],
     fit_and_predict: Callable[[str, pd.DataFrame, pd.DataFrame], Sequence[float]],
+    event_time_smoothing_sigma_s: float = 0.01,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Evaluate hazard models on repeated, group-disjoint held-out samples.
 
     ``fit_and_predict`` receives one model name plus a training and held-out
     table, and must return one held-out hazard probability per test row. It is
     responsible for fitting all model preprocessing from the training table.
+    The event-time summary uses the specified Gaussian smoothing scale.
     """
     if group_column not in data.columns:
         raise ValueError(f"data is missing group column {group_column!r}.")
@@ -901,6 +974,7 @@ def evaluate_repeated_hazard_holdout(
                     event_column=event_column,
                     split_id=split_id,
                     model_name=model_name,
+                    event_time_smoothing_sigma_s=event_time_smoothing_sigma_s,
                 )
             )
             prediction = test_data.loc[:, [group_column, time_column, event_column]].copy()

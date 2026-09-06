@@ -10,8 +10,10 @@ from src.ecological_neuro.utils import (
     find_distance_matched_pairs,
     hazard_calibration_table,
     make_group_holdout_splits,
+    mean_discrete_hazard_event_distribution,
     score_discrete_hazard_predictions,
     smooth_time_series,
+    smoothed_event_mass_mode,
     summarize_paired_hazard_scores,
 )
 
@@ -198,7 +200,7 @@ def test_scores_discrete_hazards_and_pairs_candidates_with_baseline() -> None:
         model_name="tau",
     )
 
-    assert np.isclose(candidate_scores.loc[0, "predicted_time_s"], 0.18, atol=0.02)
+    assert np.isclose(candidate_scores.loc[0, "predicted_time_s"], 0.2)
     assert (candidate_scores["negative_log_likelihood"] < baseline_scores["negative_log_likelihood"]).all()
     assert (candidate_scores["absolute_time_error_s"] < baseline_scores["absolute_time_error_s"]).all()
 
@@ -229,3 +231,24 @@ def test_discrete_hazard_event_distribution_respects_survival() -> None:
 
     np.testing.assert_allclose(event_mass, [0.2, 0.4, 0.2])
     np.testing.assert_allclose(cumulative_probability, [0.2, 0.6, 0.8])
+
+
+def test_mean_event_distribution_converts_each_hazard_before_averaging() -> None:
+    event_mass, cumulative_probability = mean_discrete_hazard_event_distribution(
+        [[0.2, 0.5, 0.5], [0.4, 0.0, 0.0]]
+    )
+
+    np.testing.assert_allclose(event_mass, [0.3, 0.2, 0.1])
+    np.testing.assert_allclose(cumulative_probability, [0.3, 0.5, 0.6])
+
+
+def test_smoothed_event_mass_mode_uses_event_mass_not_conditional_hazard() -> None:
+    time_s = np.arange(5) * 0.001
+    event_mass = np.array([0.01, 0.02, 0.08, 0.06, 0.01])
+
+    predicted_time_s, smoothed_mass = smoothed_event_mass_mode(
+        event_mass, time_s, smoothing_sigma_s=0.001
+    )
+
+    assert np.isclose(predicted_time_s, time_s[np.argmax(smoothed_mass)])
+    assert np.isclose(predicted_time_s, 0.002)
