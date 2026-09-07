@@ -27,7 +27,7 @@ class ForecastConfig:
     horizon_s: float = 0.1
     decision_interval_s: float = 0.01
     smoothing_time_constant_s: float = 0.1
-    warmup_s: float = 0.1
+    warmup_s: float = 0.01
     movement_speed_floor: float = 25.0
     movement_confirmation_s: float = 0.05
     closure_speed_floor: float = 10.0
@@ -326,18 +326,25 @@ def forecast_calibration(predictions: pd.DataFrame, *, n_bins: int = 10) -> pd.D
 
 def plot_forecast_examples(
     predictions: pd.DataFrame, records: Sequence[Mapping], group_ids: Sequence,
-    *, titles: Sequence[str] | None = None,
+    *, titles: Sequence[str] | None = None, context_margin_s: float = 0.15,
 ):
-    """Full-reach position and rolling horizon probabilities; no event-time MAP.
+    """Zoomed-window position and rolling horizon probabilities; no event-time MAP.
 
     Pass one model and optionally one split. Otherwise average probabilities
     over test appearances at the same decision time. Only evaluated times are
     drawn; unavailable post-event predictions are never replaced with zeros.
+
+    The x-axis is cropped to the evaluated decision window plus
+    ``context_margin_s`` of surrounding context on each side, not the full
+    recorded reach. Pre-movement hold and post-arrival dwell are typically
+    several times longer than the evaluated window and would otherwise
+    dominate the plot while carrying no forecast. The full reach duration is
+    reported in the title so cropping is explicit rather than silent.
     """
     import matplotlib.pyplot as plt
 
     lookup = {record["group_id"]: record for record in records}
-    fig, axes = plt.subplots(2 * len(group_ids), 1, figsize=(8, 3.4 * len(group_ids)), squeeze=False)
+    fig, axes = plt.subplots(2 * len(group_ids), 1, figsize=(8, 3.8 * len(group_ids)), squeeze=False)
     for row, group_id in enumerate(group_ids):
         top, bottom = axes[2*row:2*row+2, 0]
         record = lookup[group_id]
@@ -350,6 +357,10 @@ def plot_forecast_examples(
         curve = values.groupby("time_s", sort=True).agg(probability=("probability", "mean"),
                                                         outcome=("event_within_horizon", "first"))
         horizon = float(values.horizon_s.iloc[0])
+        reach_start_s, reach_end_s = float(time[0] - time[0]), float(time[-1] - time[0])
+        window_start_s = min(curve.index.min(), event - horizon) - time[0] - context_margin_s
+        window_end_s = min(reach_end_s, event - time[0] + context_margin_s)
+        window_start_s = max(reach_start_s, window_start_s)
         top.plot(time-time[0], gap, color="0.35", lw=1.5)
         top.scatter(event-time[0], np.interp(event, time, gap), color="crimson", marker="*", s=90,
                     label="Observed brake", zorder=3)
@@ -360,14 +371,14 @@ def plot_forecast_examples(
         for axis in (top, bottom):
             axis.axvspan(max(time[0], event-horizon)-time[0], event-time[0], color="crimson", alpha=0.08)
             axis.axvline(event-time[0], color="crimson", lw=1.2)
-            axis.set_xlim(0, time[-1]-time[0])
+            axis.set_xlim(window_start_s, window_end_s)
             axis.set_xlabel("Time in reach (s)")
             axis.legend(fontsize=7, frameon=False)
         title = titles[row] if titles is not None else f"Reach {group_id}"
-        top.set(title=f"{title} ({values.split_id.nunique()} held-out fits)",
+        top.set(title=f"{title} ({values.split_id.nunique()} fits; {reach_end_s:.2f}s reach, zoomed)",
                 ylabel=f"Remaining gap ({record.get('spatial_unit', 'configured units')})")
         bottom.set(title="Prospective braking probability", ylabel="Probability", ylim=(-0.03, 1.03))
-    fig.tight_layout(h_pad=1.4)
+    fig.tight_layout(h_pad=2.2)
     return fig
 
 

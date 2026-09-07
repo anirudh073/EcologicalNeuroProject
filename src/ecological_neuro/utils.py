@@ -12,8 +12,12 @@ __all__ = [
     "BrakingMetrics",
     "BrakingPeriod",
     "TerminalCorrection",
+    "backward_differentiate_time_series",
     "calculate_braking_metrics",
+    "calculate_causal_closure_speed",
+    "calculate_causal_speed",
     "calculate_closure_speed",
+    "causal_gaussian_smooth_time_series",
     "discrete_hazard_event_distribution",
     "detect_braking_period",
     "detect_terminal_correction",
@@ -134,6 +138,47 @@ def smooth_time_series(
     return smoothed
 
 
+def causal_gaussian_smooth_time_series(
+    timestamps_s: Sequence[float],
+    values: Sequence[float],
+    *,
+    smoothing_sigma_s: float,
+    max_gap_multiplier: float = 3.0,
+    truncation_sds: float = 4.0,
+) -> np.ndarray:
+    """Gaussian-smooth each finite run using only its present and past values.
+
+    At a time point ``t``, the kernel contains observations from ``t - 4 sigma``
+    through ``t`` only.  This deliberately produces a small, predictable lag in
+    exchange for preventing future movement from entering an online predictor.
+    """
+    if smoothing_sigma_s < 0:
+        raise ValueError("smoothing_sigma_s must be non-negative.")
+    if truncation_sds <= 0:
+        raise ValueError("truncation_sds must be positive.")
+    time, value_array, runs, _ = _prepare_time_series(
+        timestamps_s, values, max_gap_multiplier
+    )
+    smoothed = np.full(value_array.shape, np.nan, dtype=float)
+    for run_indices in runs:
+        run_time = time[run_indices]
+        run_values = value_array[run_indices]
+        if smoothing_sigma_s == 0:
+            smoothed[run_indices] = run_values
+            continue
+        window_s = truncation_sds * smoothing_sigma_s
+        for local_index, timestamp_s in enumerate(run_time):
+            first_local_index = int(
+                np.searchsorted(run_time, timestamp_s - window_s, side="left")
+            )
+            lags_s = timestamp_s - run_time[first_local_index : local_index + 1]
+            weights = np.exp(-0.5 * (lags_s / smoothing_sigma_s) ** 2)
+            smoothed[run_indices[local_index]] = np.average(
+                run_values[first_local_index : local_index + 1], weights=weights
+            )
+    return smoothed
+
+
 def differentiate_time_series(
     timestamps_s: Sequence[float],
     values: Sequence[float],
@@ -149,6 +194,24 @@ def differentiate_time_series(
         derivative[run_indices] = np.gradient(
             value_array[run_indices], time[run_indices]
         )
+    return derivative
+
+
+def backward_differentiate_time_series(
+    timestamps_s: Sequence[float],
+    values: Sequence[float],
+    *,
+    max_gap_multiplier: float = 3.0,
+) -> np.ndarray:
+    """Differentiate finite runs with a backward difference using no future data."""
+    time, value_array, runs, _ = _prepare_time_series(
+        timestamps_s, values, max_gap_multiplier
+    )
+    derivative = np.full(value_array.shape, np.nan, dtype=float)
+    for run_indices in runs:
+        run_time = time[run_indices]
+        run_values = value_array[run_indices]
+        derivative[run_indices[1:]] = np.diff(run_values) / np.diff(run_time)
     return derivative
 
 
@@ -171,6 +234,57 @@ def calculate_closure_speed(
     )
 
 
+def calculate_causal_closure_speed(
+    timestamps_s: Sequence[float],
+    remaining_gap: Sequence[float],
+    *,
+    smoothing_sigma_s: float = 0.0,
+    max_gap_multiplier: float = 3.0,
+) -> np.ndarray:
+    """Calculate closure speed from a past-only smoothed remaining-gap trace."""
+    smoothed_gap = causal_gaussian_smooth_time_series(
+        timestamps_s,
+        remaining_gap,
+        smoothing_sigma_s=smoothing_sigma_s,
+        max_gap_multiplier=max_gap_multiplier,
+    )
+    return -backward_differentiate_time_series(
+        timestamps_s, smoothed_gap, max_gap_multiplier=max_gap_multiplier
+    )
+
+
+def calculate_causal_speed(
+    timestamps_s: Sequence[float],
+    position: Sequence[Sequence[float]],
+    *,
+    smoothing_sigma_s: float = 0.0,
+    max_gap_multiplier: float = 3.0,
+) -> np.ndarray:
+    """Calculate scalar position speed from past-only derivatives and smoothing."""
+    coordinates = np.asarray(position, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] < 1:
+        raise ValueError("position must have shape (samples, dimensions).")
+    time = np.asarray(timestamps_s, dtype=float)
+    if len(time) != len(coordinates):
+        raise ValueError("timestamps_s and position must have equal lengths.")
+    velocity_components = np.column_stack(
+        [
+            backward_differentiate_time_series(
+                time, coordinates[:, dimension], max_gap_multiplier=max_gap_multiplier
+            )
+            for dimension in range(coordinates.shape[1])
+        ]
+    )
+    raw_speed = np.linalg.norm(velocity_components, axis=1)
+    raw_speed[~np.isfinite(velocity_components).all(axis=1)] = np.nan
+    return causal_gaussian_smooth_time_series(
+        time,
+        raw_speed,
+        smoothing_sigma_s=smoothing_sigma_s,
+        max_gap_multiplier=max_gap_multiplier,
+    )
+
+
 def _signed_angle_degrees(first: np.ndarray, second: np.ndarray) -> float:
     """Return the signed planar angle from one vector to another."""
     cross = first[0] * second[1] - first[1] * second[0]
@@ -183,6 +297,7 @@ def detect_terminal_correction(
     speed: Sequence[float],
     movement_onset_index: int,
     *,
+    movement_end_index: int | None = None,
     terminal_path_fraction: float = 0.10,
     movement_speed_floor: float = 25.0,
     smoothing_sigma_s: float = 0.05,
@@ -196,9 +311,9 @@ def detect_terminal_correction(
 ) -> TerminalCorrection | None:
     """Detect a sharp, spatially supported turn near movement-path completion.
 
-    The terminal window is a fraction of the realized movement path, ending at
-    the last sample above ``movement_speed_floor``. This prevents post-arrival
-    dwell and unstable headings at near-zero speed from creating false turns.
+    The terminal window is a fraction of the realized movement path. When
+    ``movement_end_index`` is supplied, that behavior-defined endpoint is used;
+    otherwise the endpoint is the last sample above ``movement_speed_floor``.
     """
     time = np.asarray(timestamps_s, dtype=float)
     coordinates = np.asarray(position, dtype=float)
@@ -213,6 +328,12 @@ def detect_terminal_correction(
         raise ValueError("timestamps_s must be finite and strictly increasing.")
     if not 0 <= movement_onset_index < len(time):
         raise IndexError("movement_onset_index is outside the input arrays.")
+    if movement_end_index is not None and not (
+        movement_onset_index < movement_end_index < len(time)
+    ):
+        raise IndexError(
+            "movement_end_index must follow movement_onset_index and be inside the arrays."
+        )
     if not 0 < terminal_path_fraction <= 1:
         raise ValueError("terminal_path_fraction must be in (0, 1].")
     positive_parameters = (
@@ -229,14 +350,15 @@ def detect_terminal_correction(
     if onset_tangent_arc_length > incoming_arc_length:
         raise ValueError("onset_tangent_arc_length cannot exceed incoming_arc_length.")
 
-    moving = np.flatnonzero(
-        (np.arange(len(time)) >= movement_onset_index)
-        & np.isfinite(speed_array)
-        & (speed_array >= movement_speed_floor)
-    )
-    if moving.size == 0:
-        return None
-    movement_end_index = min(int(moving[-1]) + 1, len(time) - 1)
+    if movement_end_index is None:
+        moving = np.flatnonzero(
+            (np.arange(len(time)) >= movement_onset_index)
+            & np.isfinite(speed_array)
+            & (speed_array >= movement_speed_floor)
+        )
+        if moving.size == 0:
+            return None
+        movement_end_index = min(int(moving[-1]) + 1, len(time) - 1)
 
     smoothed = np.column_stack(
         [

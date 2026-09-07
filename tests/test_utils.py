@@ -1,8 +1,12 @@
 import numpy as np
 
 from src.ecological_neuro.utils import (
+    backward_differentiate_time_series,
     calculate_braking_metrics,
+    calculate_causal_closure_speed,
+    calculate_causal_speed,
     calculate_closure_speed,
+    causal_gaussian_smooth_time_series,
     discrete_hazard_event_distribution,
     detect_braking_period,
     detect_terminal_correction,
@@ -90,6 +94,27 @@ def test_terminal_correction_rejects_straight_path_and_stationary_jitter() -> No
     assert event is None
 
 
+def test_terminal_correction_uses_explicit_movement_endpoint() -> None:
+    time = np.linspace(0.0, 1.2, 241)
+    path_distance = 100.0 * time
+    position = np.column_stack(
+        [np.minimum(path_distance, 90.0), np.maximum(path_distance - 90.0, 0.0)]
+    )
+    speed = np.full(time.shape, 100.0)
+
+    event = detect_terminal_correction(
+        time,
+        position,
+        speed,
+        movement_onset_index=0,
+        movement_end_index=200,
+        smoothing_sigma_s=0.0,
+    )
+
+    assert event is not None
+    assert event.movement_end_index == 200
+
+
 def test_calculates_signed_closure_speed() -> None:
     time = np.linspace(0.0, 2.0, 21)
     remaining_gap = 10.0 - 5.0 * time
@@ -112,6 +137,51 @@ def test_closure_speed_uses_the_common_smoothing_pipeline() -> None:
 
     expected = -differentiate_time_series(time, smoothed_gap)
     np.testing.assert_allclose(closure_speed, expected, equal_nan=True)
+
+
+def test_causal_smoother_is_unchanged_by_future_values() -> None:
+    time = np.arange(0.0, 2.0, 0.01)
+    values = np.sin(3.0 * time)
+    altered_values = values.copy()
+    altered_values[100:] += 100.0
+
+    original = causal_gaussian_smooth_time_series(
+        time, values, smoothing_sigma_s=0.05
+    )
+    altered = causal_gaussian_smooth_time_series(
+        time, altered_values, smoothing_sigma_s=0.05
+    )
+
+    np.testing.assert_allclose(original[:100], altered[:100])
+
+
+def test_causal_derivatives_use_only_present_and_past_samples() -> None:
+    time = np.array([0.0, 0.1, 0.3, 0.6, 1.0])
+    values = time**2
+
+    derivative = backward_differentiate_time_series(time, values)
+    closure_speed = calculate_causal_closure_speed(
+        time, 10.0 - values, smoothing_sigma_s=0.0
+    )
+
+    np.testing.assert_allclose(
+        derivative[1:], np.diff(values) / np.diff(time)
+    )
+    np.testing.assert_allclose(closure_speed[1:], derivative[1:])
+
+
+def test_causal_speed_is_not_changed_by_future_positions() -> None:
+    time = np.arange(0.0, 2.0, 0.01)
+    position = np.column_stack([100.0 * time, np.zeros_like(time)])
+    altered_position = position.copy()
+    altered_position[120:, 1] = 1000.0
+
+    original = calculate_causal_speed(time, position, smoothing_sigma_s=0.05)
+    altered = calculate_causal_speed(
+        time, altered_position, smoothing_sigma_s=0.05
+    )
+
+    np.testing.assert_allclose(original[:120], altered[:120], equal_nan=True)
 
 
 def test_calculates_braking_point_and_period_metrics() -> None:
